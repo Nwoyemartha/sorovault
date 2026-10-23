@@ -16,6 +16,7 @@ import (
 // - Declares a type for each user-defined type in the interface
 // - Exports a Client interface with one method per function
 // - Uses the contract's ABI version
+// - Uses field names as String types for user-defined types.
 func Rust(iface *model.Interface, src Source) (string, error) {
 	var b strings.Builder
 
