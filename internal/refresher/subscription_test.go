@@ -3,6 +3,10 @@ package refresher_test
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -71,4 +75,42 @@ func TestInactiveSubscriptionsAreNotNotified(t *testing.T) {
 	_, err = f.refresher(t).Sweep(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, rec.all())
+}
+
+// TestSubscriptionDeliveryRetriesWithTheBody proves a receiver that fails
+// once is retried, and that the retry carries the payload: one request
+// cannot be sent twice, so each attempt must build its own.
+func TestSubscriptionDeliveryRetriesWithTheBody(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var mu sync.Mutex
+	var bodies [][]byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		body, _ := io.ReadAll(req.Body)
+		mu.Lock()
+		defer mu.Unlock()
+		bodies = append(bodies, body)
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	f := newFixture(t)
+	id := contractID(t, 1)
+	f.register(t, id, "v1")
+	_, err := f.db.Subscribe(ctx, "testnet", []string{id}, srv.URL)
+	require.NoError(t, err)
+
+	f.fake.Upgrade(id, moduleWith(t, "v2"))
+	f.clock.Advance(interval + time.Minute)
+	_, err = f.refresher(t).Sweep(ctx)
+	require.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, bodies, 2, "a 502 is retried once and the retry succeeds")
+	assert.NotEmpty(t, bodies[1], "the retry carries the payload")
+	assert.Equal(t, bodies[0], bodies[1])
 }

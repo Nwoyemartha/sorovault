@@ -122,7 +122,7 @@ func (m *Memory) GetSubscription(ctx context.Context, secret string) (*Subscript
 	k := secret
 	sub, ok := m.subs[k]
 	if !ok {
-		return nil, fmt.Errorf("%w: subscription %s not found", ErrNotFound, secret)
+		return nil, fmt.Errorf("%w: subscription not found", ErrNotFound)
 	}
 	// Return a clone so the caller can mutate it safely.
 	out := sub
@@ -142,7 +142,7 @@ func (m *Memory) MarkSubscriptionInactive(ctx context.Context, secret string) er
 	k := secret
 	sub, ok := m.subs[k]
 	if !ok {
-		return fmt.Errorf("%w: subscription %s not found", ErrNotFound, secret)
+		return fmt.Errorf("%w: subscription not found", ErrNotFound)
 	}
 	sub.Active = false
 	m.subs[k] = sub
@@ -159,7 +159,7 @@ func (m *Memory) Unsubscribe(ctx context.Context, secret string) error {
 
 	k := secret
 	if _, ok := m.subs[k]; !ok {
-		return fmt.Errorf("%w: subscription %s not found", ErrNotFound, secret)
+		return fmt.Errorf("%w: subscription not found", ErrNotFound)
 	}
 	delete(m.subs, k)
 	return nil

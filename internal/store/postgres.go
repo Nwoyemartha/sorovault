@@ -886,7 +886,7 @@ func (p *Postgres) ListSubscriptions(ctx context.Context) ([]SubscriptionListIte
 	}
 	defer rows.Close()
 
-	var items []SubscriptionListItem
+	items := []SubscriptionListItem{}
 	for rows.Next() {
 		var id, network string
 		var contractIDsStr string
@@ -920,6 +920,9 @@ func (p *Postgres) GetSubscription(ctx context.Context, secret string) (*Subscri
 	var active bool
 	var createdAt time.Time
 	err := p.pool.QueryRow(ctx, q, secret).Scan(&id, &network, &contractIDsStr, &url, &active, &createdAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("%w: subscription not found", ErrNotFound)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("store: getting subscription: %w", err)
 	}
@@ -946,7 +949,7 @@ func (p *Postgres) MarkSubscriptionInactive(ctx context.Context, secret string) 
 		return fmt.Errorf("store: marking subscription inactive: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: subscription %s not found", ErrNotFound, secret)
+		return fmt.Errorf("%w: subscription not found", ErrNotFound)
 	}
 	return nil
 }
@@ -959,7 +962,7 @@ func (p *Postgres) Unsubscribe(ctx context.Context, secret string) error {
 		return fmt.Errorf("store: unsubscribing: %w", err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: subscription %s not found", ErrNotFound, secret)
+		return fmt.Errorf("%w: subscription not found", ErrNotFound)
 	}
 	return nil
 }
