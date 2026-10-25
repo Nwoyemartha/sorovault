@@ -191,16 +191,6 @@ func deliverWebhook(ctx context.Context, url string, secret string, change Chang
 		return fmt.Errorf("refresher: encoding webhook payload: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("refresher: building webhook request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "sorovault-refresher")
-	if secret != "" {
-		req.Header.Set(SignatureHeader, Sign(secret, body))
-	}
-
 	// Retry boundedly: a receiver that hangs must not hold the sweep up.
 	timeoutFn := timeout
 	if timeoutFn <= 0 {
@@ -213,13 +203,25 @@ func deliverWebhook(ctx context.Context, url string, secret string, change Chang
 
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
+		// A request body can be read once, so every attempt gets its own
+		// request; reusing one would post an empty body on a retry.
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("refresher: building webhook request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "sorovault-refresher")
+		if secret != "" {
+			req.Header.Set(SignatureHeader, Sign(secret, body))
+		}
+
 		resp, err := clientWithTimeout.Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("refresher: posting webhook (attempt %d): %w", attempt+1, err)
 			continue
 		}
-		defer func() { _ = resp.Body.Close() }()
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
 
 		if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
 			log.DebugContext(ctx, "refresh webhook delivered",
