@@ -341,13 +341,15 @@ func (r *Refresher) notify(ctx context.Context, network string, result *registry
 		ChangedAt:    r.now().UTC(),
 	}
 
-	if r.notifier != nil {
-		if err := r.notifier.Notify(ctx, change); err != nil {
-			r.log.WarnContext(ctx, "refresh webhook failed",
-				"contract_id", change.ContractID, "network", network, "error", err)
-		}
-	}
 	r.notifySubscribers(ctx, change)
+	if r.notifier == nil {
+		return
+	}
+
+	if err := r.notifier.Notify(ctx, change); err != nil {
+		r.log.WarnContext(ctx, "refresh webhook failed",
+			"contract_id", change.ContractID, "network", network, "error", err)
+	}
 }
 
 // notifySubscribers delivers a change to every active subscription on the
