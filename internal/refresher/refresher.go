@@ -12,11 +12,19 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/soroworks/sorovault/internal/registry"
+	"github.com/soroworks/sorovault/internal/stellar"
 	"github.com/soroworks/sorovault/internal/store"
+)
+
+const (
+	initialRateLimitBackoff = time.Second
+	maxRateLimitBackoff     = 16 * time.Second
+	maxRateLimitRetries     = 5
 )
 
 // Registry is the slice of *registry.Registry a sweep needs. It is an
@@ -219,6 +227,8 @@ func (r *Refresher) sweep(ctx context.Context, all bool) (Summary, error) {
 	remainder := int64(r.interval % time.Duration(count))
 	var target time.Duration
 	var remainderProgress int64
+	rateLimitBackoff := initialRateLimitBackoff
+	rateLimitLogged := false
 	for i, contract := range stale {
 		if ctx.Err() != nil {
 			return sum, ctx.Err()
@@ -238,7 +248,41 @@ func (r *Refresher) sweep(ctx context.Context, all bool) (Summary, error) {
 		}
 
 		sum.Checked++
-		result, err := r.refreshOne(ctx, contract.ContractID)
+		var result *registry.Result
+		var rateLimitRetries int
+		for {
+			result, err = r.refreshOne(ctx, contract.ContractID)
+			if !errors.Is(err, stellar.ErrRateLimited) {
+				break
+			}
+
+			if !rateLimitLogged {
+				r.log.WarnContext(ctx, "RPC rate-limited refresh sweep; backing off",
+					"contract_id", contract.ContractID, "network", network,
+					"delay", rateLimitBackoff, "error", err)
+				rateLimitLogged = true
+			} else {
+				r.log.DebugContext(ctx, "RPC still rate-limiting refresh sweep",
+					"contract_id", contract.ContractID, "network", network,
+					"delay", rateLimitBackoff)
+			}
+
+			if rateLimitRetries == maxRateLimitRetries {
+				sum.Failed++
+				return sum, nil
+			}
+			if err := r.wait(ctx, rateLimitBackoff); err != nil {
+				return sum, err
+			}
+			rateLimitRetries++
+			if rateLimitBackoff < maxRateLimitBackoff {
+				rateLimitBackoff *= 2
+				if rateLimitBackoff > maxRateLimitBackoff {
+					rateLimitBackoff = maxRateLimitBackoff
+				}
+			}
+		}
+		rateLimitBackoff = initialRateLimitBackoff
 		if err != nil {
 			// A busy registry is not a failure: the contract stays stale
 			// and the next sweep tries again. Failing it would report a
@@ -288,10 +332,6 @@ func (r *Refresher) sweep(ctx context.Context, all bool) (Summary, error) {
 // keep the registry up to date, and how fast a receiver reads about it is
 // the receiver's business.
 func (r *Refresher) notify(ctx context.Context, network string, result *registry.Result) {
-	if r.notifier == nil {
-		return
-	}
-
 	change := Change{
 		ContractID:   result.Contract.ContractID,
 		Network:      network,
@@ -301,9 +341,44 @@ func (r *Refresher) notify(ctx context.Context, network string, result *registry
 		ChangedAt:    r.now().UTC(),
 	}
 
+	r.notifySubscribers(ctx, change)
+	if r.notifier == nil {
+		return
+	}
+
 	if err := r.notifier.Notify(ctx, change); err != nil {
 		r.log.WarnContext(ctx, "refresh webhook failed",
 			"contract_id", change.ContractID, "network", network, "error", err)
+	}
+}
+
+// notifySubscribers delivers a change to every active subscription on the
+// change's network that covers the contract, signed with the subscription's
+// secret. A failed delivery is logged like the global webhook's: the sweep
+// does not wait on a receiver.
+func (r *Refresher) notifySubscribers(ctx context.Context, change Change) {
+	db := r.reg.Store()
+	items, err := db.ListSubscriptions(ctx)
+	if err != nil {
+		r.log.WarnContext(ctx, "listing webhook subscriptions failed", "error", err)
+		return
+	}
+	for _, item := range items {
+		if !item.Active || item.Network != change.Network {
+			continue
+		}
+		sub, err := db.GetSubscription(ctx, item.ID)
+		if err != nil {
+			r.log.WarnContext(ctx, "reading webhook subscription failed", "subscription", item.ID, "error", err)
+			continue
+		}
+		if !slices.Contains(sub.ContractIDs, change.ContractID) {
+			continue
+		}
+		if err := deliverWebhook(ctx, sub.URL, sub.ID, change, r.now, r.log, nil, 0); err != nil {
+			r.log.WarnContext(ctx, "subscription webhook failed",
+				"contract_id", change.ContractID, "error", err)
+		}
 	}
 }
 

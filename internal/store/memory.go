@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/soroworks/sorovault/internal/model"
+	"github.com/soroworks/sorovault/internal/spec"
 )
 
 // Memory is an in-process Store.
@@ -23,7 +24,7 @@ type Memory struct {
 	contracts map[string]Contract
 	specs     map[string][]Spec
 	wasmSpecs map[string]WasmSpec
-	subs      map[subscriptionKey]Subscription
+	subs      map[string]Subscription
 	nextID    int64
 
 	// now is the clock, swappable so tests can produce deterministic and
@@ -39,7 +40,7 @@ func NewMemory() *Memory {
 		contracts: make(map[string]Contract),
 		specs:     make(map[string][]Spec),
 		wasmSpecs: make(map[string]WasmSpec),
-		subs:      make(map[subscriptionKey]Subscription),
+		subs:      make(map[string]Subscription),
 		now:       time.Now,
 	}
 }
@@ -52,13 +53,11 @@ func (m *Memory) SetClock(now func() time.Time) {
 	m.now = now
 }
 
+// Ping satisfies Store. The memory store has no external service to ask.
+func (m *Memory) Ping(ctx context.Context) error { return ctx.Err() }
+
 // Close satisfies Store. There is nothing to release.
 func (m *Memory) Close() error { return nil }
-
-type subscriptionKey struct {
-	network string
-	id      string
-}
 
 // Subscribe creates a new webhook subscription for the given network and
 // contract IDs. Returns the subscription ID (which also serves as the
@@ -70,17 +69,18 @@ func (m *Memory) Subscribe(ctx context.Context, network string, contractIDs []st
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	id := fmt.Sprintf("sub_%d", m.nextID)
-	m.nextID++
-
-	k := subscriptionKey{network: network, id: id}
+	id, err := newSubscriptionSecret()
+	if err != nil {
+		return "", err
+	}
+	k := id
 	sub := Subscription{
-		ID:         id,
-		Network:    network,
+		ID:          id,
+		Network:     network,
 		ContractIDs: contractIDs,
-		URL:        url,
-		Active:     true,
-		CreatedAt:  m.now(),
+		URL:         url,
+		Active:      true,
+		CreatedAt:   m.now(),
 	}
 	m.subs[k] = sub
 	return id, nil
@@ -119,10 +119,10 @@ func (m *Memory) GetSubscription(ctx context.Context, secret string) (*Subscript
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	k := subscriptionKey{network: "", id: secret}
+	k := secret
 	sub, ok := m.subs[k]
 	if !ok {
-		return nil, fmt.Errorf("%w: subscription %s not found", ErrNotFound, secret)
+		return nil, fmt.Errorf("%w: subscription not found", ErrNotFound)
 	}
 	// Return a clone so the caller can mutate it safely.
 	out := sub
@@ -139,10 +139,10 @@ func (m *Memory) MarkSubscriptionInactive(ctx context.Context, secret string) er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	k := subscriptionKey{network: "", id: secret}
+	k := secret
 	sub, ok := m.subs[k]
 	if !ok {
-		return fmt.Errorf("%w: subscription %s not found", ErrNotFound, secret)
+		return fmt.Errorf("%w: subscription not found", ErrNotFound)
 	}
 	sub.Active = false
 	m.subs[k] = sub
@@ -157,9 +157,9 @@ func (m *Memory) Unsubscribe(ctx context.Context, secret string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	k := subscriptionKey{network: "", id: secret}
+	k := secret
 	if _, ok := m.subs[k]; !ok {
-		return fmt.Errorf("%w: subscription %s not found", ErrNotFound, secret)
+		return fmt.Errorf("%w: subscription not found", ErrNotFound)
 	}
 	delete(m.subs, k)
 	return nil
@@ -250,6 +250,7 @@ func (m *Memory) Save(ctx context.Context, c Contract, iface *model.Interface) e
 	c.LastRefreshed = now
 	// A saved interface means the contract was live, so it is not missing
 	// any more.
+	c.Implements = spec.ImplementedStandards(iface)
 	c.MissingSince = nil
 	m.contracts[k] = c
 
@@ -262,12 +263,13 @@ func (m *Memory) Save(ctx context.Context, c Contract, iface *model.Interface) e
 
 	m.nextID++
 	m.specs[k] = append(m.specs[k], Spec{
-		ID:         m.nextID,
-		Network:    c.Network,
-		ContractID: c.ContractID,
-		WasmHash:   c.CurrentWasmHash,
-		Interface:  cloned,
-		DecodedAt:  now,
+		ID:             m.nextID,
+		Network:        c.Network,
+		ContractID:     c.ContractID,
+		WasmHash:       c.CurrentWasmHash,
+		Interface:      cloned,
+		DecodedAt:      now,
+		ObservedLedger: c.ObservedLedger,
 	})
 	return nil
 }
@@ -616,6 +618,17 @@ func (m *Memory) ListContracts(ctx context.Context, f ListFilter) (*ContractPage
 		return nil, err
 	}
 	f.Normalize()
+	if f.Cursor != "" && f.Offset != 0 {
+		return nil, errors.New("store: a cursor and an offset are exclusive")
+	}
+	var cur listCursor
+	if f.Cursor != "" {
+		var err error
+		cur, err = decodeListCursor(f.Cursor)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -624,6 +637,9 @@ func (m *Memory) ListContracts(ctx context.Context, f ListFilter) (*ContractPage
 	needle := strings.ToLower(f.Query)
 	for k, c := range m.contracts {
 		if f.Network != "" && c.Network != f.Network {
+			continue
+		}
+		if len(f.Implements) > 0 && !hasAllStandards(c.Implements, f.Implements) {
 			continue
 		}
 		if needle != "" {
@@ -643,19 +659,47 @@ func (m *Memory) ListContracts(ctx context.Context, f ListFilter) (*ContractPage
 		matched = append(matched, c)
 	}
 
-	sort.Slice(matched, func(i, j int) bool {
-		if !matched[i].LastRefreshed.Equal(matched[j].LastRefreshed) {
-			return matched[i].LastRefreshed.After(matched[j].LastRefreshed)
-		}
-		return matched[i].ContractID < matched[j].ContractID
-	})
+	sort.Slice(matched, func(i, j int) bool { return contractListBefore(matched[i], matched[j]) })
+
+	// A cursor pages by key: the next page starts at the first row that
+	// sorts strictly after the one the cursor names. The slice is already
+	// in listing order, so that is one binary search, not a scan.
+	start := 0
+	if cur.ContractID != "" {
+		start = sort.Search(len(matched), func(i int) bool {
+			return afterListCursor(matched[i], cur)
+		})
+	} else {
+		start = f.Offset
+	}
 
 	page := &ContractPage{Total: len(matched), Contracts: []Contract{}}
-	if f.Offset < len(matched) {
-		end := min(f.Offset+f.Limit, len(matched))
-		page.Contracts = append(page.Contracts, matched[f.Offset:end]...)
+	if start < len(matched) {
+		end := min(start+f.Limit, len(matched))
+		page.Contracts = append(page.Contracts, matched[start:end]...)
+		if end < len(matched) {
+			next, err := encodeListCursor(matched[end-1])
+			if err != nil {
+				return nil, err
+			}
+			page.Next = next
+		}
 	}
 	return page, nil
+}
+
+// contractListBefore is the listing's total order: last_refreshed
+// descending, then contract ID and network ascending. Sorting and cursor
+// paging share it, so a cursor walk and the order its pages arrive in are
+// the same thing rather than two conventions that agree by luck.
+func contractListBefore(a, b Contract) bool {
+	if !a.LastRefreshed.Equal(b.LastRefreshed) {
+		return a.LastRefreshed.After(b.LastRefreshed)
+	}
+	if a.ContractID != b.ContractID {
+		return a.ContractID < b.ContractID
+	}
+	return a.Network < b.Network
 }
 
 // ListContractsByWasm returns a paged listing of the contracts that run the
@@ -787,11 +831,14 @@ func (m *Memory) ListVersions(ctx context.Context, network, contractID string) (
 
 	versions := make([]SpecVersion, 0, len(m.specs[k]))
 	for _, s := range m.specs[k] {
-		versions = append(versions, SpecVersion{
-			WasmHash:  s.WasmHash,
-			DecodedAt: s.DecodedAt,
-			Current:   s.WasmHash == c.CurrentWasmHash,
-		})
+		v := SpecVersion{DecodedAt: s.DecodedAt, Current: s.WasmHash == c.CurrentWasmHash, ObservedLedger: s.ObservedLedger}
+		if s.WasmHash == model.StellarAssetContractIdentifier {
+			v.InterfaceID = s.WasmHash
+			v.Builtin = true
+		} else {
+			v.WasmHash = s.WasmHash
+		}
+		versions = append(versions, v)
 	}
 
 	sort.Slice(versions, func(i, j int) bool {

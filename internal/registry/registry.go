@@ -26,15 +26,6 @@ import (
 	"github.com/soroworks/sorovault/internal/store"
 )
 
-const (
-	// DefaultMaxConcurrent is the registration concurrency limit when none is configured.
-	DefaultMaxConcurrent = 4
-	// DefaultAcquireTimeout is how long a registration waits for an available slot.
-	DefaultAcquireTimeout = 2 * time.Second
-)
-
-var ErrBusy = errors.New("registry: too many registrations in flight")
-
 // ErrNetworkMismatch reports that the RPC endpoint serves a different
 // network than the one configured. Continuing would file records under the
 // wrong namespace, so registration stops instead.
@@ -42,6 +33,31 @@ var ErrNetworkMismatch = errors.New("registry: RPC endpoint serves a different n
 
 // ErrInvalidWasmHash reports a hash that is not a 32-byte hexadecimal value.
 var ErrInvalidWasmHash = errors.New("registry: invalid wasm hash")
+
+// ErrBusy reports that the registry was already doing as much work as it is
+// allowed to, and the operation could not start within the wait window.
+//
+// It is not a failure of the contract or the network: the same request will
+// very likely succeed a moment later, which is why callers answer it with a
+// 503 and a Retry-After rather than a 500.
+var ErrBusy = errors.New("registry: too many registrations in flight")
+
+// How many registrations and refreshes run at once, and how long one waits
+// for a slot before it is refused.
+const (
+	// DefaultMaxConcurrent is the number of registrations and refreshes
+	// that run at once when the operator does not say otherwise.
+	//
+	// Each registration holds a WASM module in memory while it decodes, so
+	// this is what keeps peak memory finite: without it, as many clients as
+	// care to ask would download a module at the same time.
+	DefaultMaxConcurrent = 4
+
+	// DefaultAcquireTimeout is how long an operation waits for a slot
+	// before it is refused. Long enough to ride out a short burst, short
+	// enough that a client is not left waiting on a busy registry.
+	DefaultAcquireTimeout = 2 * time.Second
+)
 
 // Registry registers and refreshes contracts.
 type Registry struct {
@@ -52,6 +68,10 @@ type Registry struct {
 
 	// expectPassphrase, when set, must match what the endpoint reports.
 	expectPassphrase string
+	// peer, when set, is the URL of a peer SoroVault instance to mirror
+	// contracts from. When non-empty, the registry will periodically import
+	// contracts from the peer's API endpoint.
+	peer string
 
 	// sem bounds how many registrations and refreshes run at once, and
 	// acquireTimeout bounds how long one waits for a slot. The budget is
@@ -86,6 +106,9 @@ type Options struct {
 	// it is refused with ErrBusy. Values below one mean
 	// DefaultAcquireTimeout.
 	AcquireTimeout time.Duration
+	// Peer is the URL of a peer SoroVault instance to mirror contracts from.
+	// When set, the registry will import contracts from the peer's API.
+	Peer string
 }
 
 // New builds a Registry from its three collaborators.
@@ -108,6 +131,7 @@ func New(f stellar.Fetcher, d spec.Decoder, s store.Store, opts Options) *Regist
 		store:            s,
 		log:              log,
 		expectPassphrase: opts.ExpectPassphrase,
+		peer:             opts.Peer,
 		sem:              semaphore.NewWeighted(int64(maxConcurrent)),
 		acquireTimeout:   acquireTimeout,
 		maxConcurrent:    maxConcurrent,
@@ -129,8 +153,8 @@ type Result struct {
 	// Created is true when this call added a contract the registry had not
 	// seen before.
 	Created bool `json:"created"`
-	// Changed is true when the contract's WASM hash differed from what was
-	// stored, so a new interface version was recorded.
+	// Changed is true when the contract's interface version identifier differs
+	// from what was stored, so a new interface version was recorded.
 	Changed bool `json:"changed"`
 	// PreviousWasmHash is the hash the contract ran before, when this call
 	// changed it. It is empty when nothing changed.
@@ -177,6 +201,20 @@ func (r *Registry) Network(ctx context.Context) (string, error) {
 
 	r.network = stellar.NetworkName(passphrase)
 	return r.network, nil
+}
+
+// CheckNetwork asks the endpoint for its passphrase and verifies it against
+// the configured one, without using the cached network label.
+//
+// Readiness uses it so an endpoint that becomes unreachable after startup is
+// noticed; Network deliberately caches a successful answer forever, since a
+// resolved network does not change.
+func (r *Registry) CheckNetwork(ctx context.Context) error {
+	passphrase, err := r.fetcher.Network(ctx)
+	if err != nil {
+		return err
+	}
+	return CheckPassphrase(passphrase, r.expectPassphrase)
 }
 
 // CheckPassphrase reports whether the passphrase an endpoint reports is the
@@ -253,15 +291,25 @@ func (r *Registry) Register(ctx context.Context, contractID string) (*Result, er
 		return nil, err
 	}
 
-	iface, err := r.decoder.Decode(contract.Wasm)
-	if err != nil {
-		return nil, fmt.Errorf("registry: decoding %s: %w", contractID, err)
+	var iface *model.Interface
+	if contract.Builtin {
+		iface = model.StellarAssetContractInterface()
+	} else {
+		iface, err = r.decoder.Decode(contract.Wasm)
+		if err != nil {
+			return nil, fmt.Errorf("registry: decoding %s: %w", contractID, err)
+		}
 	}
 
+	ledger, err := r.observedLedger(ctx)
+	if err != nil {
+		return nil, err
+	}
 	record := store.Contract{
 		ContractID:      contractID,
 		Network:         network,
 		CurrentWasmHash: contract.WasmHash,
+		ObservedLedger:  ledger,
 	}
 	if err := r.store.Save(ctx, record, iface); err != nil {
 		return nil, err
@@ -285,7 +333,7 @@ func (r *Registry) Register(ctx context.Context, contractID string) (*Result, er
 	r.log.InfoContext(ctx, "registered contract",
 		"contract_id", contractID,
 		"network", network,
-		"wasm_hash", contract.WasmHash,
+		"interface_version", contract.WasmHash,
 		"created", result.Created,
 		"changed", result.Changed,
 		"functions", len(iface.Functions),
@@ -399,7 +447,7 @@ func (r *Registry) Refresh(ctx context.Context, contractID string) (*Result, err
 		}
 
 		r.log.DebugContext(ctx, "contract unchanged",
-			"contract_id", contractID, "network", network, "wasm_hash", currentHash)
+			"contract_id", contractID, "network", network, "interface_version", currentHash)
 
 		return &Result{Contract: *updated, Interface: stored.Interface}, nil
 	}
@@ -412,12 +460,22 @@ func (r *Registry) Refresh(ctx context.Context, contractID string) (*Result, err
 		return nil, err
 	}
 
-	iface, err := r.decoder.Decode(contract.Wasm)
-	if err != nil {
-		return nil, fmt.Errorf("registry: decoding %s: %w", contractID, err)
+	var iface *model.Interface
+	if contract.Builtin {
+		iface = model.StellarAssetContractInterface()
+	} else {
+		iface, err = r.decoder.Decode(contract.Wasm)
+		if err != nil {
+			return nil, fmt.Errorf("registry: decoding %s: %w", contractID, err)
+		}
 	}
 
+	ledger, err := r.observedLedger(ctx)
+	if err != nil {
+		return nil, err
+	}
 	record := *existing
+	record.ObservedLedger = ledger
 	record.CurrentWasmHash = contract.WasmHash
 	if err := r.store.Save(ctx, record, iface); err != nil {
 		return nil, err
@@ -431,8 +489,8 @@ func (r *Registry) Refresh(ctx context.Context, contractID string) (*Result, err
 	r.log.InfoContext(ctx, "contract upgraded",
 		"contract_id", contractID,
 		"network", network,
-		"from_wasm_hash", existing.CurrentWasmHash,
-		"to_wasm_hash", contract.WasmHash,
+		"from_interface_version", existing.CurrentWasmHash,
+		"to_interface_version", contract.WasmHash,
 	)
 
 	return &Result{
@@ -465,6 +523,22 @@ func (r *Registry) markMissing(ctx context.Context, network string, existing *st
 		"missing_since", updated.MissingSince)
 
 	return &Result{Contract: *updated, Missing: true}, nil
+}
+
+// observedLedger uses the RPC ledger clock when available. Test fetchers
+// without a ledger source retain null for compatibility.
+func (r *Registry) observedLedger(ctx context.Context) (*uint32, error) {
+	f, ok := r.fetcher.(interface {
+		LatestLedger(context.Context) (uint32, error)
+	})
+	if !ok {
+		return nil, nil
+	}
+	ledger, err := f.LatestLedger(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &ledger, nil
 }
 
 // Store exposes the underlying store for read-only queries the API and UI
