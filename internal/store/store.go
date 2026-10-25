@@ -9,7 +9,10 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -351,27 +354,6 @@ type Stats struct {
 	Latest *Contract `json:"latest_contract,omitempty"`
 }
 
-// Subscription records a per-contract webhook subscription.
-//
-// URL is the endpoint to POST changes to. Secret, when set, signs each
-// payload with HMAC-SHA256. ContractIDs specifies which contracts this
-// subscription applies to; empty means all contracts.
-type Subscription struct {
-	ID          string    `json:"id"`
-	URL         string    `json:"url"`
-	Secret      string    `json:"secret,omitempty"`
-	ContractIDs []string  `json:"contract_ids,omitempty"`
-	CreatedAt   time.Time `json:"created_at"`
-	// FailureCount tracks how many consecutive deliveries have failed.
-	// After MaxSubscriptionFailures, the subscription is disabled.
-	FailureCount int  `json:"failure_count"`
-	Disabled     bool `json:"disabled"`
-}
-
-// MaxSubscriptionFailures is the number of consecutive delivery failures
-// after which a subscription is automatically disabled.
-const MaxSubscriptionFailures = 3
-
 // Upgrade is one recorded interface upgrade: the version a contract ran
 // before, the version it moved to, and when the new one was observed.
 //
@@ -450,6 +432,32 @@ type UpgradePage struct {
 	Upgrades []Upgrade `json:"upgrades"`
 	// Total is how many upgrades match the filter, ignoring paging.
 	Total int `json:"total"`
+}
+
+// Subscription is a per-contract webhook subscription.
+type Subscription struct {
+	ID          string    `json:"id"`
+	Network     string    `json:"network"`
+	ContractIDs []string  `json:"contract_ids"`
+	URL         string    `json:"url"`
+	Secret      string    `json:"-"`
+	Active      bool      `json:"active"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// SubscribeRequest is the request body for creating a subscription.
+type SubscribeRequest struct {
+	ContractIDs []string `json:"contract_ids"`
+	URL         string   `json:"url"`
+}
+
+// SubscriptionListItem is a summary of a subscription for listing.
+type SubscriptionListItem struct {
+	ID        string `json:"id"`
+	Network   string `json:"network"`
+	Contracts int    `json:"contracts"`
+	Active    bool   `json:"active"`
+	CreatedAt string `json:"created_at"`
 }
 
 // Store is the registry's persistence layer.
@@ -531,6 +539,12 @@ type Store interface {
 	// ListVersions returns every stored version of a contract, newest first.
 	ListVersions(ctx context.Context, network, contractID string) ([]SpecVersion, error)
 
+	// GetSubscription returns a subscription by its secret (ID).
+	GetSubscription(ctx context.Context, secret string) (*Subscription, error)
+
+	// MarkSubscriptionInactive marks a subscription as inactive.
+	MarkSubscriptionInactive(ctx context.Context, secret string) error
+
 	// Ping reports whether the store's backing service answers. Readiness
 	// uses it; it must not change any stored data.
 	Ping(ctx context.Context) error
@@ -538,9 +552,25 @@ type Store interface {
 	// Close releases any resources held by the store.
 	Close() error
 
-	// Subscription operations
-	SaveSubscription(ctx context.Context, sub Subscription) error
-	GetSubscription(ctx context.Context, secret string) (Subscription, error)
-	ListSubscriptions(ctx context.Context, contractIDFilter string) ([]Subscription, error)
-	DeleteSubscription(ctx context.Context, secret string) error
+	// Subscribe creates a new webhook subscription for the given network and
+	// contract IDs. Returns the subscription ID (which also serves as the
+	// secret for HMAC signing and deletion).
+	Subscribe(ctx context.Context, network string, contractIDs []string, url string) (string, error)
+
+	// ListSubscriptions returns all subscriptions, active and inactive.
+	ListSubscriptions(ctx context.Context) ([]SubscriptionListItem, error)
+
+	// Unsubscribe removes a subscription by its secret (ID).
+	Unsubscribe(ctx context.Context, secret string) error
+}
+
+// newSubscriptionSecret returns a random 256-bit subscription ID. The ID is
+// also the secret that signs deliveries and authorises deleting the
+// subscription, so it must not be guessable.
+func newSubscriptionSecret() (string, error) {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("store: generating subscription secret: %w", err)
+	}
+	return "sub_" + hex.EncodeToString(b[:]), nil
 }

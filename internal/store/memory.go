@@ -20,12 +20,12 @@ import (
 // and so `sorovault` can be run against a throwaway registry. It is not
 // durable: everything is lost when the process exits.
 type Memory struct {
-	mu            sync.RWMutex
-	contracts     map[string]Contract
-	specs         map[string][]Spec
-	wasmSpecs     map[string]WasmSpec
-	subscriptions map[string]Subscription
-	nextID        int64
+	mu        sync.RWMutex
+	contracts map[string]Contract
+	specs     map[string][]Spec
+	wasmSpecs map[string]WasmSpec
+	subs      map[string]Subscription
+	nextID    int64
 
 	// now is the clock, swappable so tests can produce deterministic and
 	// strictly ordered timestamps.
@@ -37,11 +37,11 @@ var _ Store = (*Memory)(nil)
 // NewMemory returns an empty in-memory store.
 func NewMemory() *Memory {
 	return &Memory{
-		contracts:     make(map[string]Contract),
-		specs:         make(map[string][]Spec),
-		wasmSpecs:     make(map[string]WasmSpec),
-		subscriptions: make(map[string]Subscription),
-		now:           time.Now,
+		contracts: make(map[string]Contract),
+		specs:     make(map[string][]Spec),
+		wasmSpecs: make(map[string]WasmSpec),
+		subs:      make(map[string]Subscription),
+		now:       time.Now,
 	}
 }
 
@@ -59,78 +59,110 @@ func (m *Memory) Ping(ctx context.Context) error { return ctx.Err() }
 // Close satisfies Store. There is nothing to release.
 func (m *Memory) Close() error { return nil }
 
-// SaveSubscription stores a per-contract webhook subscription.
-func (m *Memory) SaveSubscription(ctx context.Context, sub Subscription) error {
+// Subscribe creates a new webhook subscription for the given network and
+// contract IDs. Returns the subscription ID (which also serves as the
+// secret for HMAC signing and deletion).
+func (m *Memory) Subscribe(ctx context.Context, network string, contractIDs []string, url string) (string, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return "", err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// Use the secret as the key; empty secret gets a generated ID
-	key := sub.Secret
-	if key == "" {
-		key = fmt.Sprintf("sub-%d", m.nextID)
-		m.nextID++
+
+	id, err := newSubscriptionSecret()
+	if err != nil {
+		return "", err
 	}
-	sub.CreatedAt = m.now()
-	m.subscriptions[key] = sub
-	return nil
+	k := id
+	sub := Subscription{
+		ID:          id,
+		Network:     network,
+		ContractIDs: contractIDs,
+		URL:         url,
+		Active:      true,
+		CreatedAt:   m.now(),
+	}
+	m.subs[k] = sub
+	return id, nil
 }
 
-// GetSubscription returns a subscription by its secret.
-func (m *Memory) GetSubscription(ctx context.Context, secret string) (Subscription, error) {
+// ListSubscriptions returns all subscriptions, active and inactive.
+func (m *Memory) ListSubscriptions(ctx context.Context) ([]SubscriptionListItem, error) {
 	if err := ctx.Err(); err != nil {
-		return Subscription{}, ctx.Err()
+		return nil, err
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	sub, ok := m.subscriptions[secret]
+
+	items := make([]SubscriptionListItem, 0, len(m.subs))
+	for _, sub := range m.subs {
+		items = append(items, SubscriptionListItem{
+			ID:        sub.ID,
+			Network:   sub.Network,
+			Contracts: len(sub.ContractIDs),
+			Active:    sub.Active,
+			CreatedAt: sub.CreatedAt.UTC().Format(time.RFC3339),
+		})
+	}
+	// Sort by created_at descending
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].CreatedAt > items[j].CreatedAt
+	})
+	return items, nil
+}
+
+// GetSubscription returns a subscription by its secret (ID).
+func (m *Memory) GetSubscription(ctx context.Context, secret string) (*Subscription, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	k := secret
+	sub, ok := m.subs[k]
 	if !ok {
-		return Subscription{}, ErrNotFound
+		return nil, fmt.Errorf("%w: subscription not found", ErrNotFound)
 	}
-	return sub, nil
+	// Return a clone so the caller can mutate it safely.
+	out := sub
+	out.ContractIDs = make([]string, len(sub.ContractIDs))
+	copy(out.ContractIDs, sub.ContractIDs)
+	return &out, nil
 }
 
-// ListSubscriptions returns all subscriptions, optionally filtered by contract ID.
-func (m *Memory) ListSubscriptions(ctx context.Context, contractIDFilter string) ([]Subscription, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, ctx.Err()
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	var out []Subscription
-	for _, sub := range m.subscriptions {
-		if contractIDFilter == "" {
-			out = append(out, sub)
-			continue
-		}
-		// Include subscription if it applies to all contracts or the specific one
-		if len(sub.ContractIDs) == 0 || contains(sub.ContractIDs, contractIDFilter) {
-			out = append(out, sub)
-		}
-	}
-	return out, nil
-}
-
-// DeleteSubscription removes a subscription by its secret.
-func (m *Memory) DeleteSubscription(ctx context.Context, secret string) error {
+// MarkSubscriptionInactive marks a subscription as inactive.
+func (m *Memory) MarkSubscriptionInactive(ctx context.Context, secret string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.subscriptions, secret)
+
+	k := secret
+	sub, ok := m.subs[k]
+	if !ok {
+		return fmt.Errorf("%w: subscription not found", ErrNotFound)
+	}
+	sub.Active = false
+	m.subs[k] = sub
 	return nil
 }
 
-// contains reports whether a string slice contains the target.
-func contains(lst []string, target string) bool {
-	for _, v := range lst {
-		if v == target {
-			return true
-		}
+// Unsubscribe removes a subscription by its secret (ID).
+func (m *Memory) Unsubscribe(ctx context.Context, secret string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return false
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	k := secret
+	if _, ok := m.subs[k]; !ok {
+		return fmt.Errorf("%w: subscription not found", ErrNotFound)
+	}
+	delete(m.subs, k)
+	return nil
 }
 
 func key(network, contractID string) string { return network + "\x00" + contractID }
