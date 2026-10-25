@@ -20,18 +20,18 @@ const (
 
 // Params are the parameters for an MCP method call.
 type Params struct {
-	Method  Method      `json:"method"`
-	ID      float64     `json:"id"`
-	JSONRPC string      `json:"jsonrpc"`
+	Method  Method          `json:"method"`
+	ID      float64         `json:"id"`
+	JSONRPC string          `json:"jsonrpc"`
 	Data    json.RawMessage `json:"params"`
 }
 
 // Result is the result of an MCP method call.
 type Result struct {
-	JSONRPC string      `json:"jsonrpc"`
-	ID      float64     `json:"id"`
+	JSONRPC string          `json:"jsonrpc"`
+	ID      float64         `json:"id"`
 	Result  json.RawMessage `json:"result"`
-	Error   *MCPError   `json:"error,omitempty"`
+	Error   *MCPError       `json:"error,omitempty"`
 }
 
 // MCPError represents an MCP error.
@@ -47,7 +47,7 @@ type Server interface {
 }
 
 // mcpServer is the default MCP server implementation.
-type mcpServer{}
+type mcpServer struct{}
 
 // NewServer creates a new MCP server instance.
 func NewServer() Server {
